@@ -1,0 +1,22 @@
+# SFTP同步配置
+scan_interval: 10  # 扫描间隔（秒）
+verify_enabled: true  # 是否启用文件校验
+
+sync_configs:
+  # 第一个同步任务
+  - name: "任务1"  # 任务名称
+    source_dir: "/home/smart/tmp"  # 源目录
+    backup_dir: "/home/smart/tmp/backup"  # 备份目录
+    file_extensions:              # 需要同步的文件后缀
+      - ".svg"
+      - ".xml"
+    modified_enabled: false       # 是否启用最近修改时间过滤
+    modified_minutes: 1440       # 最近修改时间（分钟）
+    backup_enabled: true         # 是否启用备份
+    targets:                     # 目标服务器列表
+      - ip: "192.168.31.20"     # 目标服务器IP
+        port: 22222                 # SFTP端口
+        username: "smart"        # 用户名
+        password: "Sf@jk1@135!"    # 密码
+        target_dir: "/home/smart/tmp"  # 目标目录
+
