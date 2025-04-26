@@ -57,7 +57,7 @@ type FailedFile struct {
 // SFTPSync SFTP同步结构体
 type SFTPSync struct {
 	config      *Config
-	client      *sftp.Client
+	clients     map[string]*sftp.Client // 新增：每个目标服务器只创建一个连接
 	logger      *log.Logger
 	failedFiles map[string]*FailedFile // 记录校验失败的文件
 	dirCache    map[string]bool        // 目录存在性缓存
@@ -79,6 +79,7 @@ func NewSFTPSync(configPath string) (*SFTPSync, error) {
 	logger := log.New(io.MultiWriter(os.Stdout, logFile), "", log.LstdFlags)
 	return &SFTPSync{
 		config:      config,
+		clients:     make(map[string]*sftp.Client), // 新增
 		logger:      logger,
 		failedFiles: make(map[string]*FailedFile),
 		dirCache:    make(map[string]bool),
@@ -105,8 +106,12 @@ func loadConfig(configPath string) (*Config, error) {
 	return &config, nil
 }
 
-// connect 建立SFTP连接
-func (s *SFTPSync) connect(target TargetConfig) error {
+// connect 建立SFTP连接（复用）
+func (s *SFTPSync) connect(target TargetConfig) (*sftp.Client, error) {
+	key := fmt.Sprintf("%s:%d", target.IP, target.Port)
+	if client, ok := s.clients[key]; ok {
+		return client, nil
+	}
 	sshConfig := &ssh.ClientConfig{
 		User: target.Username,
 		Auth: []ssh.AuthMethod{
@@ -114,44 +119,42 @@ func (s *SFTPSync) connect(target TargetConfig) error {
 		},
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
-
 	addr := fmt.Sprintf("%s:%d", target.IP, target.Port)
 	sshClient, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
-		return fmt.Errorf("SSH连接失败: %v", err)
+		return nil, fmt.Errorf("SSH连接失败: %v", err)
 	}
-
 	client, err := sftp.NewClient(sshClient)
 	if err != nil {
-		return fmt.Errorf("SFTP客户端创建失败: %v", err)
+		return nil, fmt.Errorf("SFTP客户端创建失败: %v", err)
 	}
-
-	s.client = client
-	return nil
+	s.clients[key] = client
+	return client, nil
 }
 
-// disconnect 关闭SFTP连接
-func (s *SFTPSync) disconnect() {
-	if s.client != nil {
-		s.client.Close()
+// disconnectAll 关闭所有SFTP连接
+func (s *SFTPSync) disconnectAll() {
+	for _, client := range s.clients {
+		client.Close()
 	}
+	s.clients = make(map[string]*sftp.Client)
 }
 
 // ensureDir 确保远程目录存在，使用缓存优化
-func (s *SFTPSync) ensureDir(path string) error {
+func (s *SFTPSync) ensureDir(client *sftp.Client, path string) error {
 	// 检查缓存
 	if s.dirCache[path] {
 		return nil
 	}
 
 	// 检查目录是否已存在
-	if _, err := s.client.Stat(path); err == nil {
+	if _, err := client.Stat(path); err == nil {
 		s.dirCache[path] = true
 		return nil
 	}
 
 	// 创建目录
-	if err := s.client.MkdirAll(path); err != nil {
+	if err := client.MkdirAll(path); err != nil {
 		return fmt.Errorf("创建目录失败: %v", err)
 	}
 
@@ -177,7 +180,7 @@ func getFileMD5(filePath string) (string, error) {
 }
 
 // verifyFile 验证文件是否一致
-func (s *SFTPSync) verifyFile(localPath, remotePath string) (bool, error) {
+func (s *SFTPSync) verifyFile(client *sftp.Client, localPath, remotePath string) (bool, error) {
 	// 计算本地文件的MD5
 	localMD5, err := getFileMD5(localPath)
 	if err != nil {
@@ -198,7 +201,7 @@ func (s *SFTPSync) verifyFile(localPath, remotePath string) (bool, error) {
 	defer os.Remove(tempFile.Name())
 	defer tempFile.Close()
 
-	remoteFile, err := s.client.Open(remotePath)
+	remoteFile, err := client.Open(remotePath)
 	if err != nil {
 		return false, fmt.Errorf("打开远程文件失败: %v", err)
 	}
@@ -278,34 +281,24 @@ func isFileInUse(filePath string) (bool, error) {
 
 // syncFiles 同步文件
 func (s *SFTPSync) syncFiles() error {
-	// 处理之前校验失败的文件
 	s.processFailedFiles()
-
 	for _, syncConfig := range s.config.SyncConfigs {
 		s.logger.Printf("开始同步任务: %s", syncConfig.Name)
-
-		// 确保备份目录存在
 		if syncConfig.BackupEnabled {
 			if err := os.MkdirAll(syncConfig.BackupDir, 0755); err != nil {
 				return fmt.Errorf("创建备份目录失败: %v", err)
 			}
 		}
-
-		// 获取需要同步的文件
 		files, err := s.getRecentFiles(syncConfig.SourceDir, syncConfig.FileExtensions, syncConfig.ModifiedEnabled, syncConfig.ModifiedMinutes)
 		if err != nil {
 			return fmt.Errorf("获取文件列表失败: %v", err)
 		}
-
-		// 对每个目标服务器进行同步
 		for _, target := range syncConfig.Targets {
-			s.logger.Printf("开始同步到服务器: %s:%d", target.IP, target.Port)
-
-			if err := s.connect(target); err != nil {
+			client, err := s.connect(target)
+			if err != nil {
 				s.logger.Printf("连接失败: %v", err)
 				continue
 			}
-
 			for _, filePath := range files {
 				// 检查文件是否正在被写入
 				inUse, err := isFileInUse(filePath)
@@ -317,22 +310,18 @@ func (s *SFTPSync) syncFiles() error {
 					s.logger.Printf("文件正在被写入，跳过: %s", filePath)
 					continue
 				}
-
 				relPath, err := filepath.Rel(syncConfig.SourceDir, filePath)
 				if err != nil {
 					s.logger.Printf("获取相对路径失败: %v", err)
 					continue
 				}
-
 				targetPath := filepath.Join(target.TargetDir, relPath)
 				targetDir := filepath.Dir(targetPath)
-
 				// 确保目标目录存在
-				if err := s.ensureDir(targetDir); err != nil {
+				if err := s.ensureDir(client, targetDir); err != nil {
 					s.logger.Printf("确保目录存在失败: %v", err)
 					continue
 				}
-
 				// 上传文件
 				sourceFile, err := os.Open(filePath)
 				if err != nil {
@@ -340,24 +329,20 @@ func (s *SFTPSync) syncFiles() error {
 					continue
 				}
 				defer sourceFile.Close()
-
-				targetFile, err := s.client.Create(targetPath)
+				targetFile, err := client.Create(targetPath)
 				if err != nil {
 					s.logger.Printf("创建目标文件失败: %v", err)
 					continue
 				}
 				defer targetFile.Close()
-
 				if _, err := io.Copy(targetFile, sourceFile); err != nil {
 					s.logger.Printf("复制文件失败: %v", err)
 					continue
 				}
-
 				s.logger.Printf("已上传: %s -> %s@%s:%s", filePath, target.Username, target.IP, targetPath)
-
 				// 验证文件
 				if s.config.VerifyEnabled {
-					matches, err := s.verifyFile(filePath, targetPath)
+					matches, err := s.verifyFile(client, filePath, targetPath)
 					if err != nil {
 						s.logger.Printf("文件校验失败: %v", err)
 						s.recordFailedFile(filePath, target, err)
@@ -365,38 +350,28 @@ func (s *SFTPSync) syncFiles() error {
 					}
 					if matches {
 						s.logger.Printf("文件校验成功: %s", filePath)
-						// 如果文件之前校验失败，现在成功了，从失败列表中移除
 						delete(s.failedFiles, filePath)
 					} else {
 						s.logger.Printf("文件校验失败: %s 与远程文件不一致", filePath)
 						s.recordFailedFile(filePath, target, fmt.Errorf("文件校验失败：MD5不匹配"))
 					}
 				}
-
-				// 备份文件
 				if syncConfig.BackupEnabled {
 					backupPath := filepath.Join(syncConfig.BackupDir, relPath)
 					backupDir := filepath.Dir(backupPath)
-
 					if err := os.MkdirAll(backupDir, 0755); err != nil {
 						s.logger.Printf("创建备份目录失败: %v", err)
 						continue
 					}
-
-					// 移动文件到备份目录
 					if err := os.Rename(filePath, backupPath); err != nil {
 						s.logger.Printf("移动文件到备份目录失败: %v", err)
 						continue
 					}
-
 					s.logger.Printf("已备份: %s -> %s", filePath, backupPath)
 				}
 			}
-
-			s.disconnect()
 		}
 	}
-
 	return nil
 }
 
@@ -413,10 +388,12 @@ func (s *SFTPSync) processFailedFiles() {
 		// 尝试重新同步
 		s.logger.Printf("重试同步文件: %s (第 %d 次尝试)", filePath, failedFile.RetryCount+1)
 
-		if err := s.connect(failedFile.Target); err != nil {
+		client, err := s.connect(failedFile.Target)
+		if err != nil {
 			s.logger.Printf("连接失败: %v", err)
 			continue
 		}
+		defer client.Close()
 
 		// 重新上传文件
 		if err := s.retrySyncFile(filePath, failedFile); err != nil {
@@ -428,8 +405,6 @@ func (s *SFTPSync) processFailedFiles() {
 			// 同步成功，从失败列表中移除
 			delete(s.failedFiles, filePath)
 		}
-
-		s.disconnect()
 	}
 }
 
@@ -456,7 +431,7 @@ func (s *SFTPSync) retrySyncFile(filePath string, failedFile *FailedFile) error 
 	targetDir := filepath.Dir(targetPath)
 
 	// 确保目标目录存在
-	if err := s.client.MkdirAll(targetDir); err != nil {
+	if err := s.clients[targetPath].MkdirAll(targetDir); err != nil {
 		return fmt.Errorf("创建目标目录失败: %v", err)
 	}
 
@@ -467,7 +442,7 @@ func (s *SFTPSync) retrySyncFile(filePath string, failedFile *FailedFile) error 
 	}
 	defer sourceFile.Close()
 
-	targetFile, err := s.client.Create(targetPath)
+	targetFile, err := s.clients[targetPath].Create(targetPath)
 	if err != nil {
 		return fmt.Errorf("创建目标文件失败: %v", err)
 	}
@@ -479,7 +454,7 @@ func (s *SFTPSync) retrySyncFile(filePath string, failedFile *FailedFile) error 
 
 	// 验证文件
 	if s.config.VerifyEnabled {
-		matches, err := s.verifyFile(filePath, targetPath)
+		matches, err := s.verifyFile(s.clients[targetPath], filePath, targetPath)
 		if err != nil {
 			return fmt.Errorf("文件校验失败: %v", err)
 		}
@@ -522,4 +497,6 @@ func main() {
 			sync.logger.Printf("同步失败: %v", err)
 		}
 	}
+
+	defer sync.disconnectAll()
 }
